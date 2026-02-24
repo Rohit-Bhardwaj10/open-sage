@@ -1,8 +1,9 @@
 version: "3.9"
 
 services:
+  # ── Postgres ──────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16        # pgvector built-in for Phase 2
     container_name: open-sage-db
     restart: unless-stopped
     environment:
@@ -13,11 +14,50 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./prisma/init-pgvector.sql:/docker-entrypoint-initdb.d/init-pgvector.sql
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opensage} -d ${POSTGRES_DB:-opensage_db}" ]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opensage} -d ${POSTGRES_DB:-opensage_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  # ── Redis (queue backbone) ────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: open-sage-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes  # persist queue across restarts
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Ingestion + Embedding Worker (Python) ─────────────────────
+  # Uncomment once you've built the worker/ service:
+  #
+  # worker:
+  #   build: ../worker
+  #   container_name: open-sage-worker
+  #   restart: unless-stopped
+  #   environment:
+  #     DATABASE_URL: postgresql://opensage:opensage_secret@postgres:5432/opensage_db
+  #     REDIS_URL: redis://redis:6379
+  #     CLONES_DIR: /clones
+  #     OPENAI_API_KEY: ${OPENAI_API_KEY}
+  #   volumes:
+  #     - clones_data:/clones
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+
 volumes:
   postgres_data:
+  redis_data:
+  clones_data:     # shared volume between worker and (optionally) next.js
