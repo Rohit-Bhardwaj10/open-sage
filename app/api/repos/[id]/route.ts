@@ -3,10 +3,11 @@ import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
 import prisma from "@/lib/prisma";
 import { getCloneQueue } from "@/lib/queue";
+import { rm } from "fs/promises";
 
 /**
  * DELETE /api/repos/[id]
- * Remove a repository record (does not delete the local clone — worker handles cleanup)
+ * Remove a repository record and its local clone from disk.
  */
 export async function DELETE(
   _req: NextRequest,
@@ -40,7 +41,20 @@ export async function DELETE(
     // Continue with deletion even if job removal fails
   }
 
+  // Delete DB record (cascades to IndexedFile → CodeChunk, ChatMessage)
   await prisma.repository.delete({ where: { id } });
+
+  // Remove local clone directory from disk
+  if (repo.localPath) {
+    try {
+      await rm(repo.localPath, { recursive: true, force: true });
+      console.log(`[API] Removed local clone at ${repo.localPath}`);
+    } catch (err) {
+      console.warn(`[API] Could not remove local clone at ${repo.localPath}:`, err);
+      // Non-fatal — directory may already be gone
+    }
+  }
 
   return NextResponse.json({ message: "Repository removed" }, { status: 200 });
 }
+

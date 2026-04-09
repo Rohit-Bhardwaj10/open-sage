@@ -1,13 +1,13 @@
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 
-// ── Redis connection (shared singleton) ───────────────────────
+// ── Redis connection (shared singleton) 
 // maxRetriesPerRequest: null is required by BullMQ
 export const redis = new IORedis(process.env.REDIS_URL ?? "redis://localhost:6379", {
   maxRetriesPerRequest: null,
 });
 
-// ── Typed job payloads ────────────────────────────────────────
+// Typed job payloads 
 
 export interface CloneJobPayload {
   repoId: string;

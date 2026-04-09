@@ -2,9 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
 import prisma from "@/lib/prisma";
-import { queryRepositoryStream } from "@/lib/rag";
+import { queryRepositoryStream, findSimilarChunks, generateQueryEmbedding } from "@/lib/rag";
 
-/**
+/*
  * GET /api/chat/[repoId]
  * Returns chat history for a repo
  *
@@ -118,6 +118,31 @@ export async function POST(
           controller.enqueue(encoder.encode(chunk));
         }
 
+        // Build sources from a quick vector search (same query, same model)
+        let sources: Array<{
+          file: string;
+          lineStart: number;
+          lineEnd: number;
+          snippet: string;
+          score: number;
+        }> = [];
+
+        try {
+          const queryEmbedding = await generateQueryEmbedding(question.trim());
+          const similar = await findSimilarChunks(repoId, queryEmbedding, 5);
+          sources = similar
+            .filter((s) => s.similarity > 0.3) // only meaningful matches
+            .map((s) => ({
+              file: s.file.filePath,
+              lineStart: s.chunk.startLine,
+              lineEnd: s.chunk.endLine,
+              snippet: s.chunk.content.slice(0, 300),
+              score: s.similarity,
+            }));
+        } catch {
+          // Sources are optional — don't fail the request
+        }
+
         // Save assistant response after streaming completes
         await prisma.chatMessage.create({
           data: {
@@ -125,8 +150,10 @@ export async function POST(
             userId: session.user.id,
             role: "ASSISTANT",
             content: fullResponse,
-            sources: [],
-            confidence: null,
+            sources: sources.length > 0 ? (sources as any) : [],
+            confidence: sources.length > 0
+              ? sources.reduce((acc, s) => acc + s.score, 0) / sources.length
+              : null,
           },
         });
 
@@ -163,3 +190,10 @@ export async function DELETE(
 
   return NextResponse.json({ message: "Chat history cleared" });
 }
+// import findSimilarChunks
+function findSimilarChunks(repoId: string, queryEmbedding: number[], limit?: number): Promise<{
+    chunk: any;
+    similarity: number;
+    file: any;
+}[]>
+// Find similar code chunks using pgvector similarity search

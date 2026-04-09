@@ -10,7 +10,35 @@ const hf = new HfInference(HF_TOKEN);
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
 const EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5";
-const GEMINI_MODEL = "gemini-1.5-flash"; // Free tier: 15 RPM, 1 million TPM
+// const EMBEDDING_MODEL = "google/embeddinggemma-300m:fastest";
+
+// gemini-2.0-flash-lite has a more generous free-tier quota than gemini-2.0-flash
+const GEMINI_MODEL = "gemini-3-flash-preview"; // Experimental preview – separate free-tier quota
+
+// ── Retry helper ──────────────────────────────────────────────
+
+/**
+ * Retry an async operation on 429 quota errors using the API-provided retryDelay
+ * or exponential back-off (cap: 60 s, max 3 attempts).
+ */
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await fn();
+        } catch (err: any) {
+            const is429 = err?.status === 429 || err?.message?.includes("429");
+            if (!is429 || attempt === maxAttempts) throw err;
+
+            // Parse the retry delay from the API error body if present (e.g. "54s")
+            const match = err?.message?.match(/retryDelay["\s:]+(\d+)s/);
+            const delaySec = match ? parseInt(match[1], 10) : Math.min(10 * 2 ** attempt, 60);
+            console.warn(`[RAG] 429 quota hit – retrying in ${delaySec}s (attempt ${attempt}/${maxAttempts})`);
+            await new Promise((r) => setTimeout(r, delaySec * 1000));
+        }
+    }
+    // TypeScript: unreachable, but satisfies return type
+    throw new Error("Retry limit exceeded");
+}
 
 // ── Embedding Generation ──────────────────────────────────────
 
@@ -195,9 +223,9 @@ Instructions:
 - Provide code examples when helpful
 - Be concise but thorough`;
 
-        // Stream response from Gemini
+        // Stream response from Gemini (with automatic 429 retry)
         const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-        const result = await model.generateContentStream(prompt);
+        const result = await withRetry(() => model.generateContentStream(prompt));
 
         for await (const chunk of result.stream) {
             const text = chunk.text();
@@ -205,7 +233,12 @@ Instructions:
         }
     } catch (error: any) {
         console.error("Error in RAG query:", error);
-        yield `\n\nError: ${error.message || "Failed to generate response"}`;
+        const isQuota = error?.message?.includes("429") || error?.status === 429;
+        if (isQuota) {
+            yield `\n\n⚠️ **Quota exceeded.** The Gemini API free-tier limit has been reached. Please wait a minute and try again, or upgrade your Google AI plan at https://ai.google.dev/gemini-api/docs/rate-limits.`;
+        } else {
+            yield `\n\nError: ${error.message || "Failed to generate response"}`;
+        }
     }
 }
 

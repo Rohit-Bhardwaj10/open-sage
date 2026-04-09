@@ -16,18 +16,48 @@ const EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5";
 const CHUNK_SIZE = 1000; // characters per chunk
 const CHUNK_OVERLAP = 200; // overlap between chunks for context preservation
 
-/**
- * Split text into overlapping chunks
- */
-function chunkText(text: string, chunkSize: number, overlap: number): string[] {
-    const chunks: string[] = [];
-    let start = 0;
+interface TextChunk {
+    content: string;
+    startLine: number;
+    endLine: number;
+}
 
+/**
+ * Split text into overlapping chunks, computing real line numbers
+ */
+function chunkText(text: string, chunkSize: number, overlap: number): TextChunk[] {
+    const chunks: TextChunk[] = [];
+    const lines = text.split("\n");
+
+    // Build cumulative character offsets per line so we can map char → line
+    const lineOffsets: number[] = [];
+    let offset = 0;
+    for (const line of lines) {
+        lineOffsets.push(offset);
+        offset += line.length + 1; // +1 for the newline character
+    }
+
+    function charToLine(charPos: number): number {
+        let lo = 0;
+        let hi = lineOffsets.length - 1;
+        while (lo < hi) {
+            const mid = Math.floor((lo + hi + 1) / 2);
+            if (lineOffsets[mid] <= charPos) lo = mid;
+            else hi = mid - 1;
+        }
+        return lo + 1; // 1-indexed
+    }
+
+    let start = 0;
     while (start < text.length) {
         const end = Math.min(start + chunkSize, text.length);
-        chunks.push(text.slice(start, end));
+        const content = text.slice(start, end);
+        chunks.push({
+            content,
+            startLine: charToLine(start),
+            endLine: charToLine(end - 1),
+        });
 
-        // Move start forward, but with overlap
         start += chunkSize - overlap;
 
         // Avoid creating tiny final chunks
@@ -97,40 +127,50 @@ async function processEmbeddingJob(job: any) {
             where: { fileId },
         });
 
+        let embeddedCount = 0;
+
         // Process each chunk and generate embeddings
         for (let i = 0; i < chunks.length; i++) {
-            const chunkText = chunks[i];
+            const { content: chunkContent, startLine, endLine } = chunks[i];
 
             // Skip empty chunks
-            if (!chunkText.trim()) {
+            if (!chunkContent.trim()) {
                 continue;
             }
 
-            console.log(`[EMBEDDING] Generating embedding for chunk ${i + 1}/${chunks.length}`);
+            console.log(`[EMBEDDING] Generating embedding for chunk ${i + 1}/${chunks.length} (L${startLine}-L${endLine})`);
 
             // Generate embedding
-            const embedding = await generateEmbedding(chunkText);
+            const embedding = await generateEmbedding(chunkContent);
 
-            // Store chunk with embedding in database using raw SQL (pgvector compatibility)
+            // Store chunk with embedding and real line numbers
             await prisma.$executeRaw`
                 INSERT INTO "CodeChunk" (id, "fileId", "chunkIndex", content, "startLine", "endLine", embedding, "createdAt")
                 VALUES (
                     gen_random_uuid()::text,
                     ${fileId},
                     ${i},
-                    ${chunkText},
-                    0,
-                    0,
+                    ${chunkContent},
+                    ${startLine},
+                    ${endLine},
                     ${`[${embedding.join(",")}]`}::vector,
                     NOW()
                 )
             `;
 
-            // Add small delay to avoid rate limiting (Hugging Face free tier)
+            embeddedCount++;
+
+            // Small delay to avoid rate limiting (Hugging Face free tier)
             await new Promise(resolve => setTimeout(resolve, 100));
         }
 
-        console.log(`[EMBEDDING] ✓ Completed ${filePath} - ${chunks.length} chunks embedded`);
+        // Update IndexedFile with final chunk count
+        await prisma.indexedFile.update({
+            where: { id: fileId },
+            data: { chunkCount: embeddedCount },
+        });
+
+        console.log(`[EMBEDDING] ✓ Completed ${filePath} - ${embeddedCount} chunks embedded`);
 
     } catch (error) {
         console.error(`[EMBEDDING] Failed to process ${filePath}:`, error);

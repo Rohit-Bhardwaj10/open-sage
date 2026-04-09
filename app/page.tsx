@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { authClient } from "@/lib/auth-client";
+import Link from "next/link";
 
 // ────────────────────────────────────────────────────────────────
 // Types
@@ -287,10 +288,12 @@ interface RepoCardProps {
   repo: Repo;
   onClone: (id: string) => void;
   onDelete: (id: string) => void;
+  onRetryIndex: (id: string) => void;
   isCloning: boolean;
+  isRetryingIndex: boolean;
 }
 
-function RepoCard({ repo, onClone, onDelete, isCloning }: RepoCardProps) {
+function RepoCard({ repo, onClone, onDelete, onRetryIndex, isCloning, isRetryingIndex }: RepoCardProps) {
   const avatarUrl = getGithubAvatarUrl(repo.name);
 
   return (
@@ -389,7 +392,16 @@ function RepoCard({ repo, onClone, onDelete, isCloning }: RepoCardProps) {
         <div className="repo-actions-row">
           {repo.cloneStatus === "CLONED" ? (
             repo.indexStatus === "INDEXED" ? (
-              <span className="badge-success">✓ Ready to chat</span>
+              <Link
+                href={`/chat/${repo.id}`}
+                className="btn-sm btn-accent"
+                style={{ textDecoration: "none" }}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                </svg>
+                Chat
+              </Link>
             ) : repo.indexStatus === "INDEXING" ? (
               <span className="indexing-label">
                 <Spinner size={12} />
@@ -400,7 +412,14 @@ function RepoCard({ repo, onClone, onDelete, isCloning }: RepoCardProps) {
                 …
               </span>
             ) : repo.indexStatus === "FAILED" ? (
-              <span className="badge-error">✗ Index failed</span>
+              <button
+                className="btn-sm btn-danger"
+                onClick={() => onRetryIndex(repo.id)}
+                disabled={isRetryingIndex}
+              >
+                {isRetryingIndex ? <Spinner size={12} /> : null}
+                {isRetryingIndex ? "Retrying…" : "Retry index"}
+              </button>
             ) : (
               <span className="badge-info">⏳ Waiting to index</span>
             )
@@ -504,6 +523,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
   const [cloningIds, setCloningIds] = useState<Set<string>>(new Set());
+  const [retryingIndexIds, setRetryingIndexIds] = useState<Set<string>>(new Set());
 
   // Redirect if unauthenticated
   useEffect(() => {
@@ -577,6 +597,24 @@ export default function Dashboard() {
     setRepos((prev) => [repo, ...prev]);
   };
 
+  const handleRetryIndex = async (repoId: string) => {
+    setRetryingIndexIds((s) => new Set(s).add(repoId));
+    try {
+      await fetch(`/api/repos/${repoId}/index`, { method: "POST" });
+      setRepos((prev) =>
+        prev.map((r) =>
+          r.id === repoId ? { ...r, indexStatus: "INDEXING" } : r
+        )
+      );
+    } finally {
+      setRetryingIndexIds((s) => {
+        const n = new Set(s);
+        n.delete(repoId);
+        return n;
+      });
+    }
+  };
+
   const handleDelete = async (repoId: string) => {
     try {
       const res = await fetch(`/api/repos/${repoId}`, { method: "DELETE" });
@@ -624,7 +662,7 @@ export default function Dashboard() {
         </div>
 
         <div className="nav-center">
-          <span className="nav-pill">Phase 1 — Repo Ingestion</span>
+          <span className="nav-pill">Dashboard</span>
         </div>
 
         <div className="nav-right">
@@ -791,7 +829,9 @@ export default function Dashboard() {
                 repo={repo}
                 onClone={handleClone}
                 onDelete={handleDelete}
+                onRetryIndex={handleRetryIndex}
                 isCloning={cloningIds.has(repo.id)}
+                isRetryingIndex={retryingIndexIds.has(repo.id)}
               />
             ))}
           </div>

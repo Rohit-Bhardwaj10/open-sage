@@ -10,7 +10,7 @@
     "worker:clone": "tsx workers/clone-worker.ts",
     "worker:index": "tsx workers/index-worker.ts",
     "worker:embedding": "tsx workers/embedding-worker.ts",
-    "worker:all": "npm run worker:clone & npm run worker:index & npm run worker:embedding",
+    "worker:all": "concurrently -k -n clone,index,embed -c blue,green,yellow \"npm run worker:clone\" \"npm run worker:index\" \"npm run worker:embedding\"",
     "queue:check": "tsx scripts/check-queue.ts",
     "queue:clear": "tsx scripts/clear-queue.ts"
   },
@@ -34,6 +34,7 @@
     "@types/pg": "^8.16.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "concurrently": "^9.2.1",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "prisma": "^7.4.1",
