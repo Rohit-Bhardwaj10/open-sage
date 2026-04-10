@@ -2,7 +2,7 @@ import "dotenv/config";
 import { Worker, Job } from "bullmq";
 import { exec } from "child_process";
 import { promisify } from "util";
-import { mkdir } from "fs/promises";
+import { mkdir, rm, access } from "fs/promises";
 import path from "path";
 import prisma from "../lib/prisma";
 import { redis, QUEUE_NAMES, type CloneJobPayload, getIndexQueue } from "../lib/queue";
@@ -49,14 +49,48 @@ async function processCloneJob(job: Job<CloneJobPayload>) {
         // Update progress
         await job.updateProgress(25);
 
+        // Clean up any previous failed/partial clone before retrying
+        try {
+            await access(localPath);
+            console.log(`[Clone Worker] Removing stale clone directory: ${localPath}`);
+            await rm(localPath, { recursive: true, force: true });
+        } catch {
+            // Directory doesn't exist — that's fine
+        }
+
+        // Enable long path support for this git operation
+        await execAsync("git config --global core.longpaths true").catch(() => {});
+
         // Git clone with depth=1 for faster cloning
         const cloneCommand = `git clone --depth 1 "${url}" "${localPath}"`;
-        const { stdout, stderr } = await execAsync(cloneCommand, {
-            timeout: 300000, // 5 min timeout
-        });
+        let cloneStderr = "";
+        try {
+            const { stdout, stderr } = await execAsync(cloneCommand, {
+                timeout: 300000, // 5 min timeout
+            });
+            cloneStderr = stderr || "";
+        } catch (cloneError: any) {
+            // git clone exited non-zero — clean up partial clone and rethrow
+            await rm(localPath, { recursive: true, force: true }).catch(() => {});
+            throw cloneError;
+        }
 
-        if (stderr && !stderr.includes("Cloning into")) {
-            console.warn(`[Clone Worker] Git stderr: ${stderr}`);
+        // Detect partial checkout failure (e.g. Windows "Filename too long")
+        if (
+            cloneStderr.includes("checkout failed") ||
+            cloneStderr.includes("Filename too long") ||
+            cloneStderr.includes("unable to create file")
+        ) {
+            await rm(localPath, { recursive: true, force: true }).catch(() => {});
+            throw new Error(
+                `Git clone succeeded but checkout failed (likely Windows long path limit). ` +
+                `Run: git config --global core.longpaths true  and enable LongPathsEnabled in Windows registry. ` +
+                `Details: ${cloneStderr.slice(0, 500)}`
+            );
+        }
+
+        if (cloneStderr && !cloneStderr.includes("Cloning into")) {
+            console.warn(`[Clone Worker] Git stderr: ${cloneStderr}`);
         }
 
         await job.updateProgress(75);

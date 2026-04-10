@@ -189,11 +189,4 @@ export async function DELETE(
   });
 
   return NextResponse.json({ message: "Chat history cleared" });
-}
-// import findSimilarChunks
-function findSimilarChunks(repoId: string, queryEmbedding: number[], limit?: number): Promise<{
-    chunk: any;
-    similarity: number;
-    file: any;
-}[]>
-// Find similar code chunks using pgvector similarity search
+}

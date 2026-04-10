@@ -1,19 +1,20 @@
 import { HfInference } from "@huggingface/inference";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import Groq from "groq-sdk";
 import prisma from "./prisma";
 
 // ── Configuration ─────────────────────────────────────────────
 const HF_TOKEN = process.env.HF_TOKEN || "";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 
 const hf = new HfInference(HF_TOKEN);
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const groq = new Groq({ apiKey: GROQ_API_KEY });
 
-const EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5";
-// const EMBEDDING_MODEL = "google/embeddinggemma-300m:fastest";
+// Must match the model used in embedding-worker.ts exactly
+const EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
+const EMBEDDING_DIMS = 384;
 
-// gemini-2.0-flash-lite has a more generous free-tier quota than gemini-2.0-flash
-const GEMINI_MODEL = "gemini-3-flash-preview"; // Experimental preview – separate free-tier quota
+// Groq model — llama-3.3-70b-versatile is fast, capable, and generous on free tier
+const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 // ── Retry helper ──────────────────────────────────────────────
 
@@ -36,30 +37,30 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
             await new Promise((r) => setTimeout(r, delaySec * 1000));
         }
     }
-    // TypeScript: unreachable, but satisfies return type
     throw new Error("Retry limit exceeded");
 }
 
 // ── Embedding Generation ──────────────────────────────────────
 
 /**
- * Generate embedding for a query using Hugging Face
+ * Generate embedding for a query using HF Inference API
+ * (sentence-transformers/all-MiniLM-L6-v2 → 384 dimensions)
  */
 export async function generateQueryEmbedding(query: string): Promise<number[]> {
     try {
         const response = await hf.featureExtraction({
             model: EMBEDDING_MODEL,
             inputs: query,
+            provider: "hf-inference",  // explicit — suppresses "Auto selected provider" log spam
         });
 
-        const embedding = Array.isArray(response) ? response : [response];
-        const flatEmbedding = embedding.flat(Infinity) as number[];
+        // HF returns nested arrays for batch or flat for single input
+        const flat = (Array.isArray(response[0]) ? response[0] : response) as number[];
 
-        if (flatEmbedding.length !== 768) {
-            throw new Error(`Expected 768 dimensions, got ${flatEmbedding.length}`);
+        if (flat.length !== EMBEDDING_DIMS) {
+            throw new Error(`Expected ${EMBEDDING_DIMS} dimensions, got ${flat.length}`);
         }
-
-        return flatEmbedding;
+        return flat;
     } catch (error) {
         console.error("Error generating query embedding:", error);
         throw error;
@@ -74,7 +75,8 @@ export async function generateQueryEmbedding(query: string): Promise<number[]> {
 export async function findSimilarChunks(
     repoId: string,
     queryEmbedding: number[],
-    limit: number = 5
+    limit: number = 5,
+    minSimilarity: number = 0.1  // minimum cosine similarity threshold
 ): Promise<Array<{
     chunk: any;
     similarity: number;
@@ -113,10 +115,24 @@ export async function findSimilarChunks(
       JOIN "IndexedFile" f ON c."fileId" = f.id
       WHERE f."repositoryId" = ${repoId}
       ORDER BY c.embedding <=> ${embeddingStr}::vector
-      LIMIT ${limit}
+      LIMIT ${limit * 3}  -- fetch extra, we'll filter by threshold below
     `;
 
-        return results.map((row: {
+        console.log(`[RAG] findSimilarChunks: found ${results.length} raw results for repo ${repoId}`);
+        if (results.length > 0) {
+            const topSims = results.slice(0, 3).map(r => Number(r.similarity).toFixed(3));
+            console.log(`[RAG] Top similarities: ${topSims.join(", ")}`);
+        } else {
+            // Diagnose: check if any CodeChunks exist for this repo
+            const chunkCount = await prisma.$queryRaw<Array<{count: bigint}>>`
+                SELECT COUNT(*) as count FROM "CodeChunk" c
+                JOIN "IndexedFile" f ON c."fileId" = f.id
+                WHERE f."repositoryId" = ${repoId}
+            `;
+            console.warn(`[RAG] No chunks returned. Total CodeChunks for repo: ${chunkCount[0]?.count ?? 0}`);
+        }
+
+        const mapped = results.map((row: {
             id: string;
             fileId: string;
             chunkIndex: number;
@@ -141,6 +157,11 @@ export async function findSimilarChunks(
                 language: row.language,
             },
         }));
+
+        // Filter by minimum similarity threshold and return up to `limit`
+        const filtered = mapped.filter(r => r.similarity >= minSimilarity).slice(0, limit);
+        console.log(`[RAG] After threshold (${minSimilarity}): ${filtered.length} chunks returned`);
+        return filtered;
     } catch (error) {
         console.error("Error finding similar chunks:", error);
         throw error;
@@ -194,7 +215,21 @@ export async function* queryRepositoryStream(
         const similarChunks = await findSimilarChunks(repoId, queryEmbedding, 5);
 
         if (similarChunks.length === 0) {
-            yield "I couldn't find any relevant code in this repository to answer your question.";
+            // Distinguish: no embeddings at all vs query didn't match
+            const chunkCount = await prisma.$queryRaw<Array<{count: bigint}>>`
+                SELECT COUNT(*) as count FROM "CodeChunk" c
+                JOIN "IndexedFile" f ON c."fileId" = f.id
+                WHERE f."repositoryId" = ${repoId}
+            `;
+            const total = Number(chunkCount[0]?.count ?? 0);
+            if (total === 0) {
+                yield "⚠️ This repository has been indexed (files found) but **embeddings have not been generated yet**. " +
+                      "The embedding worker may still be running, or it may have failed silently. " +
+                      "Please check the worker logs and try again in a moment.";
+            } else {
+                yield `I couldn't find any relevant code in this repository to answer your question. ` +
+                      `(${total} chunks are indexed — try rephrasing your question.)`;
+            }
             return;
         }
 
@@ -223,19 +258,23 @@ Instructions:
 - Provide code examples when helpful
 - Be concise but thorough`;
 
-        // Stream response from Gemini (with automatic 429 retry)
-        const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-        const result = await withRetry(() => model.generateContentStream(prompt));
+        // Stream response from Groq
+        const stream = await groq.chat.completions.create({
+            model: GROQ_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            stream: true,
+            max_tokens: 1024,
+        });
 
-        for await (const chunk of result.stream) {
-            const text = chunk.text();
-            yield text;
+        for await (const chunk of stream) {
+            const text = chunk.choices[0]?.delta?.content || "";
+            if (text) yield text;
         }
     } catch (error: any) {
         console.error("Error in RAG query:", error);
         const isQuota = error?.message?.includes("429") || error?.status === 429;
         if (isQuota) {
-            yield `\n\n⚠️ **Quota exceeded.** The Gemini API free-tier limit has been reached. Please wait a minute and try again, or upgrade your Google AI plan at https://ai.google.dev/gemini-api/docs/rate-limits.`;
+            yield `\n\n⚠️ **Quota exceeded.** The Groq API free-tier limit has been reached. Please wait a moment and try again.`;
         } else {
             yield `\n\nError: ${error.message || "Failed to generate response"}`;
         }

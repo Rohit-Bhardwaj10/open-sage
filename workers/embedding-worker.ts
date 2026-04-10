@@ -1,20 +1,60 @@
 import "dotenv/config";
 import { Worker } from "bullmq";
+import { readFileSync, existsSync } from "fs";
 import { HfInference } from "@huggingface/inference";
-import { readFileSync } from "fs";
 import prisma from "../lib/prisma";
 import { redis } from "../lib/queue";
 import type { EmbeddingJobPayload } from "../lib/queue";
 
-const HF_TOKEN = process.env.HF_TOKEN || "";
-const hf = new HfInference(HF_TOKEN);
+// ── HF Inference API embedding ────────────────────────────────
+// sentence-transformers/all-MiniLM-L6-v2 → 384 dims, hosted by HF
+// No native binaries, no sharp, no ONNX runtime required.
+const EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
+const EMBEDDING_DIMS = 384;
 
-// Embedding model: BAAI/bge-base-en-v1.5 (768 dimensions)
-const EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5";
+const hf = new HfInference(process.env.HF_TOKEN || "");
 
-// Chunking configuration
-const CHUNK_SIZE = 1000; // characters per chunk
-const CHUNK_OVERLAP = 200; // overlap between chunks for context preservation
+/**
+ * Generate embeddings for a batch of texts via HF Inference API.
+ */
+async function generateEmbeddingsBatch(texts: string[]): Promise<number[][]> {
+    const BATCH_SIZE = 10;   // max concurrent HF API calls at a time
+    const BATCH_DELAY = 200; // ms pause between batches to avoid rate limit
+    const results: number[][] = [];
+
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+        const batch = texts.slice(i, i + BATCH_SIZE);
+
+        const batchEmbeddings = await Promise.all(
+            batch.map(async (text) => {
+                const response = await hf.featureExtraction({
+                    model: EMBEDDING_MODEL,
+                    inputs: text,
+                    provider: "hf-inference",  // explicit — suppresses "Auto selected provider" log spam
+                });
+                const flat = (Array.isArray(response[0]) ? response[0] : response) as number[];
+                if (flat.length !== EMBEDDING_DIMS) {
+                    throw new Error(`Expected ${EMBEDDING_DIMS} dims, got ${flat.length}`);
+                }
+                return flat;
+            })
+        );
+
+        results.push(...batchEmbeddings);
+
+        // Pause between batches to stay within HF free-tier rate limits
+        if (i + BATCH_SIZE < texts.length) {
+            await new Promise((r) => setTimeout(r, BATCH_DELAY));
+        }
+    }
+
+    return results;
+}
+
+
+// ── Chunking ──────────────────────────────────────────────────
+const CHUNK_SIZE = 1000;    // characters per chunk
+const CHUNK_OVERLAP = 200;  // overlap for context continuity
 
 interface TextChunk {
     content: string;
@@ -22,182 +62,136 @@ interface TextChunk {
     endLine: number;
 }
 
-/**
- * Split text into overlapping chunks, computing real line numbers
- */
 function chunkText(text: string, chunkSize: number, overlap: number): TextChunk[] {
     const chunks: TextChunk[] = [];
     const lines = text.split("\n");
 
-    // Build cumulative character offsets per line so we can map char → line
+    // Cumulative char offsets per line for mapping char→line
     const lineOffsets: number[] = [];
     let offset = 0;
     for (const line of lines) {
         lineOffsets.push(offset);
-        offset += line.length + 1; // +1 for the newline character
+        offset += line.length + 1;
     }
 
     function charToLine(charPos: number): number {
-        let lo = 0;
-        let hi = lineOffsets.length - 1;
+        let lo = 0, hi = lineOffsets.length - 1;
         while (lo < hi) {
             const mid = Math.floor((lo + hi + 1) / 2);
-            if (lineOffsets[mid] <= charPos) lo = mid;
-            else hi = mid - 1;
+            if (lineOffsets[mid] <= charPos) lo = mid; else hi = mid - 1;
         }
-        return lo + 1; // 1-indexed
+        return lo + 1;
     }
 
     let start = 0;
     while (start < text.length) {
         const end = Math.min(start + chunkSize, text.length);
-        const content = text.slice(start, end);
         chunks.push({
-            content,
+            content: text.slice(start, end),
             startLine: charToLine(start),
             endLine: charToLine(end - 1),
         });
-
         start += chunkSize - overlap;
-
-        // Avoid creating tiny final chunks
-        if (start < text.length && text.length - start < overlap) {
-            break;
-        }
+        if (start < text.length && text.length - start < overlap) break;
     }
 
     return chunks;
 }
 
-/**
- * Generate embedding for text using Hugging Face API
- */
-async function generateEmbedding(text: string): Promise<number[]> {
-    try {
-        const response = await hf.featureExtraction({
-            model: EMBEDDING_MODEL,
-            inputs: text,
-        });
+// ── Job processor ─────────────────────────────────────────────
 
-        // Response is typically an array or nested array
-        const embedding = Array.isArray(response) ? response : [response];
-
-        // Flatten if nested
-        const flatEmbedding = embedding.flat(Infinity) as number[];
-
-        if (flatEmbedding.length !== 768) {
-            throw new Error(`Expected 768 dimensions, got ${flatEmbedding.length}`);
-        }
-
-        return flatEmbedding;
-    } catch (error) {
-        console.error("Error generating embedding:", error);
-        throw error;
-    }
-}
-
-/**
- * Process embedding job: chunk file content and generate embeddings
- */
 async function processEmbeddingJob(job: any) {
     const { repoId, fileId, filePath, localPath } = job.data as EmbeddingJobPayload;
 
-    console.log(`[EMBEDDING] Processing file: ${filePath}`);
+    console.log(`[EMBEDDING] Processing: ${filePath}`);
 
-    try {
-        // Read file content
-        const content = readFileSync(localPath, "utf-8");
-
-        // Check if file still exists in database
-        const file = await prisma.indexedFile.findUnique({
-            where: { id: fileId },
-        });
-
-        if (!file) {
-            console.log(`[EMBEDDING] File ${fileId} was deleted, skipping`);
-            return;
-        }
-
-        // Chunk the content
-        const chunks = chunkText(content, CHUNK_SIZE, CHUNK_OVERLAP);
-        console.log(`[EMBEDDING] Created ${chunks.length} chunks for ${filePath}`);
-
-        // Delete existing chunks for this file (in case of re-indexing)
-        await prisma.codeChunk.deleteMany({
-            where: { fileId },
-        });
-
-        let embeddedCount = 0;
-
-        // Process each chunk and generate embeddings
-        for (let i = 0; i < chunks.length; i++) {
-            const { content: chunkContent, startLine, endLine } = chunks[i];
-
-            // Skip empty chunks
-            if (!chunkContent.trim()) {
-                continue;
-            }
-
-            console.log(`[EMBEDDING] Generating embedding for chunk ${i + 1}/${chunks.length} (L${startLine}-L${endLine})`);
-
-            // Generate embedding
-            const embedding = await generateEmbedding(chunkContent);
-
-            // Store chunk with embedding and real line numbers
-            await prisma.$executeRaw`
-                INSERT INTO "CodeChunk" (id, "fileId", "chunkIndex", content, "startLine", "endLine", embedding, "createdAt")
-                VALUES (
-                    gen_random_uuid()::text,
-                    ${fileId},
-                    ${i},
-                    ${chunkContent},
-                    ${startLine},
-                    ${endLine},
-                    ${`[${embedding.join(",")}]`}::vector,
-                    NOW()
-                )
-            `;
-
-            embeddedCount++;
-
-            // Small delay to avoid rate limiting (Hugging Face free tier)
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-
-        // Update IndexedFile with final chunk count
-        await prisma.indexedFile.update({
-            where: { id: fileId },
-            data: { chunkCount: embeddedCount },
-        });
-
-        console.log(`[EMBEDDING] ✓ Completed ${filePath} - ${embeddedCount} chunks embedded`);
-
-    } catch (error) {
-        console.error(`[EMBEDDING] Failed to process ${filePath}:`, error);
-        throw error;
+    // Guard: file must exist on disk
+    if (!existsSync(localPath)) {
+        console.warn(`[EMBEDDING] ⚠ File not found on disk, skipping: ${localPath}`);
+        await prisma.indexedFile.deleteMany({ where: { id: fileId } }).catch(() => {});
+        return;
     }
+
+    const content = readFileSync(localPath, "utf-8");
+
+    // Verify file still in DB
+    const file = await prisma.indexedFile.findUnique({ where: { id: fileId } });
+    if (!file) {
+        console.log(`[EMBEDDING] File ${fileId} deleted from DB, skipping`);
+        return;
+    }
+
+    // Chunk the file
+    const allChunks = chunkText(content, CHUNK_SIZE, CHUNK_OVERLAP)
+        .filter(c => c.content.trim().length > 0);
+
+    if (allChunks.length === 0) {
+        console.log(`[EMBEDDING] No content to embed for ${filePath}`);
+        return;
+    }
+
+    console.log(`[EMBEDDING] ${allChunks.length} chunks — generating embeddings in batch...`);
+    const t0 = Date.now();
+
+    // Delete stale chunks for re-indexing
+    await prisma.codeChunk.deleteMany({ where: { fileId } });
+
+    // ── BATCH: embed ALL chunks in one model call ──────────────
+    const texts = allChunks.map(c => c.content);
+    const embeddings = await generateEmbeddingsBatch(texts);
+
+    console.log(`[EMBEDDING] ✓ Batch embedding done in ${Date.now() - t0}ms`);
+
+    // ── BATCH INSERT: all chunks in one SQL statement ──────────
+    // Build VALUES list: (id, fileId, chunkIndex, content, startLine, endLine, embedding::vector, now())
+    const insertPromises = allChunks.map((chunk, i) =>
+        prisma.$executeRaw`
+            INSERT INTO "CodeChunk" (id, "fileId", "chunkIndex", content, "startLine", "endLine", embedding, "createdAt")
+            VALUES (
+                gen_random_uuid()::text,
+                ${fileId},
+                ${i},
+                ${chunk.content},
+                ${chunk.startLine},
+                ${chunk.endLine},
+                ${`[${embeddings[i].join(",")}]`}::vector,
+                NOW()
+            )
+        `
+    );
+
+    // Run DB inserts in parallel batches of 20 to avoid overwhelming the connection pool
+    const DB_BATCH = 20;
+    for (let i = 0; i < insertPromises.length; i += DB_BATCH) {
+        await Promise.all(insertPromises.slice(i, i + DB_BATCH));
+    }
+
+    // Update file record
+    await prisma.indexedFile.update({
+        where: { id: fileId },
+        data: { chunkCount: allChunks.length },
+    });
+
+    console.log(`[EMBEDDING] ✓ ${filePath} — ${allChunks.length} chunks stored (total: ${Date.now() - t0}ms)`);
 }
 
 // ── Worker initialization ─────────────────────────────────────
+
 const worker = new Worker("embedding", processEmbeddingJob, {
     connection: redis,
-    concurrency: 2, // Process 2 files concurrently (adjust based on API limits)
-    limiter: {
-        max: 10, // Max 10 jobs per duration
-        duration: 60000, // Per minute (to respect API rate limits)
-    },
+    concurrency: 2,  // limit concurrency to stay within HF free-tier rate limits
 });
 
 worker.on("completed", (job) => {
-    console.log(`[EMBEDDING] Job ${job.id} completed`);
+    console.log(`[EMBEDDING] ✓ Job ${job.id} completed`);
 });
 
 worker.on("failed", (job, err) => {
-    console.error(`[EMBEDDING] Job ${job?.id} failed:`, err.message);
+    console.error(`[EMBEDDING] ✗ Job ${job?.id} failed:`, err.message);
 });
 
 worker.on("error", (err) => {
     console.error("[EMBEDDING] Worker error:", err);
 });
 
-console.log("🚀 Embedding worker started and listening for jobs...");
+console.log("🚀 Embedding worker started (HF API — sentence-transformers/all-MiniLM-L6-v2)");
