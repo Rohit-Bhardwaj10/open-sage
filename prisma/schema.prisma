@@ -128,8 +128,8 @@ model CodeChunk {
   startLine  Int
   endLine    Int
 
-  // Vector embedding (384 dimensions for sentence-transformers/all-MiniLM-L6-v2)
-  embedding Unsupported("vector(384)")?
+  // Vector embedding (768 dimensions for Gemini text-embedding-004)
+  embedding Unsupported("vector(768)")?
 
   createdAt DateTime @default(now())
 

@@ -34,30 +34,60 @@ interface RepoInfo {
   defaultBranch?: string;
 }
 
-// ─── Markdown-lite renderer ───────────────────────────────────
+const KEYWORDS = /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|try|catch|finally|throw|new|class|extends|import|export|from|default|async|await|typeof|instanceof|in|of|void|delete|null|undefined|true|false|this|super|static|get|set|yield|try|catch)\b/g;
+const STRINGS = /(["'`])(?:(?!\1)[^\\]|\\.)*\1/g;
+const COMMENTS = /(\/\/.*$|\/\*[\s\S]*?\*\/)/gm;
+const NUMBERS = /\b(\d+\.?\d*)\b/g;
+
+function highlightCode(code: string, lang: string): string {
+  const isTypeScript = lang === "ts" || lang === "tsx" || lang === "typescript";
+  const isJsx = lang === "jsx" || lang === "tsx";
+  
+  let highlighted = escapeHtml(code);
+  
+  highlighted = highlighted
+    .replace(COMMENTS, '<span class="chat-code-comment">$1</span>')
+    .replace(STRINGS, '<span class="chat-code-string">$&</span>')
+    .replace(KEYWORDS, '<span class="chat-code-keyword">$1</span>')
+    .replace(NUMBERS, '<span class="chat-code-number">$1</span>');
+  
+  if (isTypeScript) {
+    highlighted = highlighted
+      .replace(/:\s*(string|number|boolean|any|void|never|unknown|object|undefined|null)\b/g, '<span class="chat-code-type">:$1</span>')
+      .replace(/&lt;(.*?)&gt;/g, '<span class="chat-code-generic">&lt;$1&gt;</span>')
+      .replace(/\b(string|number|boolean|any|void|never|unknown|object|undefined|null)\b/g, '<span class="chat-code-type">$1</span>');
+  }
+  
+  if (isJsx) {
+    highlighted = highlighted
+      .replace(/(&lt;\/?)([A-Z][a-zA-Z0-9]*)/g, '$1<span class="chat-code-tag">$2</span>');
+  }
+  
+  return highlighted;
+}
 
 function renderMarkdown(text: string): string {
-  return text
-    // code blocks
-    .replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) =>
-      `<pre class="chat-code-block"><code class="language-${lang || "text"}">${escapeHtml(code.trim())}</code></pre>`
-    )
-    // inline code
+  let output = text;
+  
+  output = output
+    .replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
+      const langLabel = lang || "text";
+      const highlighted = highlightCode(code.trim(), lang || "");
+      return `<div class="chat-code-wrapper"><div class="chat-code-header"><span class="chat-code-lang">${langLabel}</span><button class="chat-code-copy" onclick="navigator.clipboard.writeText(this.closest('.chat-code-wrapper').querySelector('code').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})">Copy</button></div><pre class="chat-code-block"><code class="language-${langLabel}">${highlighted}</code></pre></div>`;
+    })
     .replace(/`([^`]+)`/g, (_, code) => `<code class="chat-inline-code">${escapeHtml(code)}</code>`)
-    // bold
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    // italic
     .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-    // headings
     .replace(/^### (.+)$/gm, "<h3 class='chat-md-h3'>$1</h3>")
     .replace(/^## (.+)$/gm, "<h2 class='chat-md-h2'>$1</h2>")
     .replace(/^# (.+)$/gm, "<h1 class='chat-md-h1'>$1</h1>")
-    // unordered lists
     .replace(/^\s*[-*] (.+)$/gm, "<li>$1</li>")
     .replace(/(<li>[\s\S]*?<\/li>)/g, "<ul class='chat-md-list'>$1</ul>")
-    // line breaks (preserve paragraphs)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" class="chat-md-link" target="_blank" rel="noopener noreferrer">$1</a>')
     .replace(/\n\n/g, "</p><p class='chat-md-p'>")
     .replace(/\n/g, "<br/>");
+  
+  return output;
 }
 
 function escapeHtml(text: string): string {
@@ -213,9 +243,11 @@ export default function ChatPage() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [clearingHistory, setClearingHistory] = useState(false);
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
 
   const endRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // ── Auth guard ─────────────────────────────────────────────
   useEffect(() => {
@@ -253,8 +285,23 @@ export default function ChatPage() {
 
   // ── Auto-scroll ────────────────────────────────────────────
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    if (messagesEndRef.current) {
+      const isNearBottom = messagesEndRef.current.scrollHeight - messagesEndRef.current.scrollTop - messagesEndRef.current.clientHeight < 200;
+      if (isNearBottom || sending) {
+        endRef.current?.scrollIntoView({ behavior: "smooth" });
+      } else {
+        setShowScrollBtn(true);
+      }
+    }
+  }, [messages, sending]);
+
+  const handleScroll = useCallback(() => {
+    if (messagesEndRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = messagesEndRef.current;
+      const isNearBottom = scrollHeight - scrollTop - clientHeight < 200;
+      setShowScrollBtn(!isNearBottom);
+    }
+  }, []);
 
   // ── Auto-resize textarea ───────────────────────────────────
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -333,7 +380,7 @@ export default function ChatPage() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if ((e.key === "Enter" && (e.ctrlKey || e.metaKey)) || (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey)) {
       e.preventDefault();
       handleSend();
     }
@@ -461,7 +508,7 @@ export default function ChatPage() {
 
       {/* ── Message List ───────────────────────────────────── */}
       <main className="chat-main">
-        <div className="chat-messages">
+        <div className="chat-messages" ref={messagesEndRef} onScroll={handleScroll}>
           {displayMessages.length === 0 ? (
             <div className="chat-empty">
               <div className="chat-empty-icon">
@@ -499,6 +546,15 @@ export default function ChatPage() {
               {displayMessages.map((msg) => (
                 <MessageBubble key={msg.id} msg={msg} repoUrl={repo?.url ?? ""} />
               ))}
+
+              {showScrollBtn && (
+                <button className="chat-scroll-btn" onClick={() => endRef.current?.scrollIntoView({ behavior: "smooth" })}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                  New messages
+                </button>
+              )}
             </>
           )}
 
@@ -522,7 +578,7 @@ export default function ChatPage() {
             <textarea
               ref={textareaRef}
               className="chat-textarea"
-              placeholder="Ask something about the codebase… (Enter to send, Shift+Enter for new line)"
+              placeholder="Ask anything about the codebase… (Ctrl+Enter to send)"
               value={input}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
@@ -546,8 +602,7 @@ export default function ChatPage() {
             </button>
           </div>
           <p className="chat-input-hint">
-            Powered by{" "}
-            <span className="chat-input-hint-accent">BAAI/bge-base-en-v1.5</span> embeddings ·{" "}
+            <span className="chat-kbd">Enter</span> send · <span className="chat-kbd">Shift+Enter</span> new line · Powered by{" "}
             <span className="chat-input-hint-accent">Gemini 1.5 Flash</span>
           </p>
         </div>

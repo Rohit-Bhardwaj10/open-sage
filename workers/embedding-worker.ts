@@ -1,38 +1,73 @@
 import "dotenv/config";
 import { Worker } from "bullmq";
 import { readFileSync, existsSync } from "fs";
-import { HfInference } from "@huggingface/inference";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import prisma from "../lib/prisma";
 import { redis } from "../lib/queue";
 import type { EmbeddingJobPayload } from "../lib/queue";
 
-// ── HF Inference API embedding ────────────────────────────────
-// sentence-transformers/all-MiniLM-L6-v2 → 384 dims, hosted by HF
-// No native binaries, no sharp, no ONNX runtime required.
-const EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
-const EMBEDDING_DIMS = 384;
+// Must match the model used in lib/rag.ts exactly
+const EMBEDDING_MODEL = "text-embedding-004";
+const EMBEDDING_DIMS = 768;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
-const hf = new HfInference(process.env.HF_TOKEN || "");
+if (!GEMINI_API_KEY) {
+    console.error("[EMBEDDING] ❌ GEMINI_API_KEY is not set in .env");
+    process.exit(1);
+}
+
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const embeddingModel = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
 
 /**
- * Generate embeddings for a batch of texts via HF Inference API.
+ * Generate embeddings for a batch of texts via Gemini API
+ * text-embedding-004: 768 dims, free tier 1500 req/min
  */
 async function generateEmbeddingsBatch(texts: string[]): Promise<number[][]> {
-    const BATCH_SIZE = 10;   // max concurrent HF API calls at a time
-    const BATCH_DELAY = 200; // ms pause between batches to avoid rate limit
     const results: number[][] = [];
 
-    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-        const batch = texts.slice(i, i + BATCH_SIZE);
+    // Process in sub-batches of 20 (Gemini supports batch embed)
+    const SUB_BATCH = 20;
+    for (let i = 0; i < texts.length; i += SUB_BATCH) {
+        const subBatch = texts.slice(i, i + SUB_BATCH);
+        const response = await embeddingModel.batchEmbedContents({
+            requests: subBatch.map(text => ({
+                model: `models/${EMBEDDING_MODEL}`,
+                content: { parts: [{ text }], role: "user" },
+                taskType: "RETRIEVAL_DOCUMENT" as any,
+            })),
+        });
+        for (const emb of response.embeddings) {
+            const flat = emb.values;
+            if (flat.length !== EMBEDDING_DIMS) {
+                throw new Error(`Expected ${EMBEDDING_DIMS} dims, got ${flat.length}`);
+            }
+            results.push(flat);
+        }
+    }
+    return results;
+}
 
-        const batchEmbeddings = await Promise.all(
-            batch.map(async (text) => {
-                const response = await hf.featureExtraction({
-                    model: EMBEDDING_MODEL,
-                    inputs: text,
-                    provider: "hf-inference",  // explicit — suppresses "Auto selected provider" log spam
+/**
+ * Generate embeddings for a batch of texts via local transformers.js
+ */
+async function generateEmbeddingsBatch(texts: string[]): Promise<number[][]> {
+    const pipe = await getEmbeddingPipeline();
+    const results: number[][] = [];
+
+    // Process in smaller sub-batches to avoid memory spikes
+    const SUB_BATCH_SIZE = 5; 
+    
+    for (let i = 0; i < texts.length; i += SUB_BATCH_SIZE) {
+        const subBatch = texts.slice(i, i + SUB_BATCH_SIZE);
+        
+        const subBatchEmbeddings = await Promise.all(
+            subBatch.map(async (text) => {
+                const output = await pipe(text, {
+                    pooling: "mean",
+                    normalize: true,
                 });
-                const flat = (Array.isArray(response[0]) ? response[0] : response) as number[];
+                const flat = Array.from(output.data) as number[];
                 if (flat.length !== EMBEDDING_DIMS) {
                     throw new Error(`Expected ${EMBEDDING_DIMS} dims, got ${flat.length}`);
                 }
@@ -40,12 +75,7 @@ async function generateEmbeddingsBatch(texts: string[]): Promise<number[][]> {
             })
         );
 
-        results.push(...batchEmbeddings);
-
-        // Pause between batches to stay within HF free-tier rate limits
-        if (i + BATCH_SIZE < texts.length) {
-            await new Promise((r) => setTimeout(r, BATCH_DELAY));
-        }
+        results.push(...subBatchEmbeddings);
     }
 
     return results;
@@ -179,7 +209,7 @@ async function processEmbeddingJob(job: any) {
 
 const worker = new Worker("embedding", processEmbeddingJob, {
     connection: redis,
-    concurrency: 2,  // limit concurrency to stay within HF free-tier rate limits
+    concurrency: 50,  // Gemini API handles parallelism — no CPU bottleneck
 });
 
 worker.on("completed", (job) => {
@@ -194,4 +224,4 @@ worker.on("error", (err) => {
     console.error("[EMBEDDING] Worker error:", err);
 });
 
-console.log("🚀 Embedding worker started (HF API — sentence-transformers/all-MiniLM-L6-v2)");
+console.log("🚀 Embedding worker started (Gemini API — text-embedding-004, 768 dims)");

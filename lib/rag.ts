@@ -1,62 +1,41 @@
-import { HfInference } from "@huggingface/inference";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import prisma from "./prisma";
 
 // ── Configuration ─────────────────────────────────────────────
-const HF_TOKEN = process.env.HF_TOKEN || "";
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-
-const hf = new HfInference(HF_TOKEN);
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
 // Must match the model used in embedding-worker.ts exactly
-const EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
-const EMBEDDING_DIMS = 384;
+const EMBEDDING_MODEL = "text-embedding-004";
+const EMBEDDING_DIMS = 768;
 
-// Groq model — llama-3.3-70b-versatile is fast, capable, and generous on free tier
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_MODEL = "llama-3.1-70b-versatile";
 
-// ── Retry helper ──────────────────────────────────────────────
-
-/**
- * Retry an async operation on 429 quota errors using the API-provided retryDelay
- * or exponential back-off (cap: 60 s, max 3 attempts).
- */
-async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-            return await fn();
-        } catch (err: any) {
-            const is429 = err?.status === 429 || err?.message?.includes("429");
-            if (!is429 || attempt === maxAttempts) throw err;
-
-            // Parse the retry delay from the API error body if present (e.g. "54s")
-            const match = err?.message?.match(/retryDelay["\s:]+(\d+)s/);
-            const delaySec = match ? parseInt(match[1], 10) : Math.min(10 * 2 ** attempt, 60);
-            console.warn(`[RAG] 429 quota hit – retrying in ${delaySec}s (attempt ${attempt}/${maxAttempts})`);
-            await new Promise((r) => setTimeout(r, delaySec * 1000));
-        }
-    }
-    throw new Error("Retry limit exceeded");
+function isOverviewQuery(query: string): boolean {
+    const lower = query.toLowerCase();
+    const overviewPatterns = [
+        "what does", "explain", "overview", "summary",
+        "what is", "how does it work", "architecture",
+        "folder structure", "project structure", "what is this",
+    ];
+    return overviewPatterns.some((p) => lower.includes(p));
 }
 
-// ── Embedding Generation ──────────────────────────────────────
-
 /**
- * Generate embedding for a query using HF Inference API
- * (sentence-transformers/all-MiniLM-L6-v2 → 384 dimensions)
+ * Generate embedding for a query using Gemini API (text-embedding-004, 768 dims)
  */
 export async function generateQueryEmbedding(query: string): Promise<number[]> {
     try {
-        const response = await hf.featureExtraction({
-            model: EMBEDDING_MODEL,
-            inputs: query,
-            provider: "hf-inference",  // explicit — suppresses "Auto selected provider" log spam
+        const embeddingModel = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
+        const result = await embeddingModel.embedContent({
+            content: { parts: [{ text: query }], role: "user" },
+            taskType: "RETRIEVAL_QUERY" as any,
         });
-
-        // HF returns nested arrays for batch or flat for single input
-        const flat = (Array.isArray(response[0]) ? response[0] : response) as number[];
-
+        const flat = result.embedding.values;
         if (flat.length !== EMBEDDING_DIMS) {
             throw new Error(`Expected ${EMBEDDING_DIMS} dimensions, got ${flat.length}`);
         }
@@ -67,7 +46,6 @@ export async function generateQueryEmbedding(query: string): Promise<number[]> {
     }
 }
 
-// ── Vector Search ─────────────────────────────────────────────
 
 /**
  * Find similar code chunks using pgvector similarity search
@@ -75,19 +53,16 @@ export async function generateQueryEmbedding(query: string): Promise<number[]> {
 export async function findSimilarChunks(
     repoId: string,
     queryEmbedding: number[],
-    limit: number = 5,
-    minSimilarity: number = 0.1  // minimum cosine similarity threshold
+    limit: number = 15,
+    minSimilarity: number = 0.2
 ): Promise<Array<{
     chunk: any;
     similarity: number;
     file: any;
 }>> {
     try {
-        // Convert embedding to pgvector format
         const embeddingStr = `[${queryEmbedding.join(",")}]`;
 
-        // Use raw SQL for vector similarity search with pgvector
-        // Using cosine distance operator (<=>)
         const results = await prisma.$queryRaw<
             Array<{
                 id: string;
@@ -120,7 +95,7 @@ export async function findSimilarChunks(
 
         console.log(`[RAG] findSimilarChunks: found ${results.length} raw results for repo ${repoId}`);
         if (results.length > 0) {
-            const topSims = results.slice(0, 3).map(r => Number(r.similarity).toFixed(3));
+            const topSims = results.slice(0, 15).map(r => Number(r.similarity).toFixed(3));
             console.log(`[RAG] Top similarities: ${topSims.join(", ")}`);
         } else {
             // Diagnose: check if any CodeChunks exist for this repo
@@ -168,11 +143,11 @@ export async function findSimilarChunks(
     }
 }
 
-// ── Context Building ──────────────────────────────────────────
 
 /**
  * Build context string from similar chunks
  */
+
 function buildContext(
     chunks: Array<{
         chunk: any;
@@ -196,74 +171,176 @@ function buildContext(
     return context;
 }
 
-// ── RAG Query with Streaming ──────────────────────────────────
 
 /**
  * Query the repository with RAG and stream the response
  */
+/**
+ * Fetch high-value overview context: README, manifests, config files, and a
+ * breadth-first sample of the file tree. Used when the query is too broad for
+ * pure vector search.
+ */
+async function fetchOverviewContext(repoId: string): Promise<string> {
+    // Priority file patterns (checked in order)
+    const PRIORITY_PATTERNS = [
+        // Documentation
+        "%readme%",
+        "%CHANGELOG%",
+        "%CONTRIBUTING%",
+        "%LICENSE%",
+        "%docs%/%.md",
+        // Manifests / config
+        "%package.json",
+        "%composer.json",
+        "%Cargo.toml",
+        "%pyproject.toml",
+        "%setup.py",
+        "%go.mod",
+        "%pom.xml",
+        "%build.gradle%",
+        // Entry points
+        "%/index.ts",
+        "%/index.js",
+        "%/main.ts",
+        "%/main.py",
+        "%/app.ts",
+        "%/app.js",
+        "%/server.ts",
+        "%/server.js",
+        "%/routes%",
+        "%/api%",
+    ];
+
+    const collected: Array<{ filePath: string; content: string; lang: string | null }> = [];
+    const seenFiles = new Set<string>();
+
+    // 1. Fetch priority files by path pattern
+    for (const pattern of PRIORITY_PATTERNS) {
+        if (collected.length >= 12) break; // cap to avoid token overload
+        const rows = await prisma.$queryRaw<Array<{ filePath: string; content: string; language: string | null }>>`
+            SELECT f."filePath", c.content, f.language
+            FROM "CodeChunk" c
+            JOIN "IndexedFile" f ON c."fileId" = f.id
+            WHERE f."repositoryId" = ${repoId}
+              AND LOWER(f."filePath") LIKE LOWER(${pattern})
+              AND c."chunkIndex" = 0
+            ORDER BY f."filePath"
+            LIMIT 3
+        `;
+        for (const row of rows) {
+            if (!seenFiles.has(row.filePath)) {
+                seenFiles.add(row.filePath);
+                collected.push({ filePath: row.filePath, content: row.content, lang: row.language });
+            }
+        }
+    }
+
+    // 2. If we still have room, sample the top-level file names (gives LLM project structure cues)
+    const fileList = await prisma.$queryRaw<Array<{ filePath: string; language: string | null }>>`
+        SELECT f."filePath", f.language
+        FROM "IndexedFile" f
+        WHERE f."repositoryId" = ${repoId}
+        ORDER BY LENGTH(f."filePath") ASC
+        LIMIT 60
+    `;
+
+    const fileTree = fileList.map((f) => f.filePath).join("\n");
+
+    let context = `=== Repository File Tree (top 60 shortest paths) ===\n${fileTree}\n\n`;
+
+    for (const { filePath, content, lang } of collected) {
+        context += `=== ${filePath} ===\n\`\`\`${lang || "text"}\n${content.slice(0, 2000)}\n\`\`\`\n\n`;
+    }
+
+    console.log(`[RAG] Overview context: ${collected.length} high-value files + file tree (${fileList.length} paths)`);
+    return context;
+}
+
 export async function* queryRepositoryStream(
     repoId: string,
     userQuery: string,
     conversationHistory: Array<{ role: "user" | "assistant"; content: string }> = []
 ): AsyncGenerator<string, void, unknown> {
     try {
-        // Generate embedding for the query
+        const overview = isOverviewQuery(userQuery);
         yield "Searching repository...\n\n";
-        const queryEmbedding = await generateQueryEmbedding(userQuery);
 
-        // Find similar code chunks
-        const similarChunks = await findSimilarChunks(repoId, queryEmbedding, 5);
-
-        if (similarChunks.length === 0) {
-            // Distinguish: no embeddings at all vs query didn't match
-            const chunkCount = await prisma.$queryRaw<Array<{count: bigint}>>`
-                SELECT COUNT(*) as count FROM "CodeChunk" c
-                JOIN "IndexedFile" f ON c."fileId" = f.id
-                WHERE f."repositoryId" = ${repoId}
-            `;
-            const total = Number(chunkCount[0]?.count ?? 0);
-            if (total === 0) {
-                yield "⚠️ This repository has been indexed (files found) but **embeddings have not been generated yet**. " +
-                      "The embedding worker may still be running, or it may have failed silently. " +
-                      "Please check the worker logs and try again in a moment.";
-            } else {
-                yield `I couldn't find any relevant code in this repository to answer your question. ` +
-                      `(${total} chunks are indexed — try rephrasing your question.)`;
-            }
+        // Check if *any* chunks exist first
+        const chunkCount = await prisma.$queryRaw<Array<{count: bigint}>>`
+            SELECT COUNT(*) as count FROM "CodeChunk" c
+            JOIN "IndexedFile" f ON c."fileId" = f.id
+            WHERE f."repositoryId" = ${repoId}
+        `;
+        const total = Number(chunkCount[0]?.count ?? 0);
+        if (total === 0) {
+            yield "⚠️ This repository has been indexed (files found) but **embeddings have not been generated yet**. " +
+                  "The embedding worker may still be running, or it may have failed silently. " +
+                  "Please check the worker logs and try again in a moment.";
             return;
         }
 
-        yield "Found relevant code. Generating response...\n\n";
+        let context = "";
 
-        // Build context from chunks
-        const context = buildContext(similarChunks);
+        if (overview) {
+            // ── Overview strategy: fetch docs + file tree directly ───────
+            console.log(`[RAG] Detected overview query — using document-fetch strategy`);
+            yield "Gathering project overview...\n\n";
+            context = await fetchOverviewContext(repoId);
+
+            // Supplement with a broad vector search (low threshold, high limit)
+            const queryEmbedding = await generateQueryEmbedding(userQuery);
+            const vectorChunks = await findSimilarChunks(repoId, queryEmbedding, 10, 0.05);
+            if (vectorChunks.length > 0) {
+                context += "\n=== Additional Relevant Chunks (vector search) ===\n";
+                context += buildContext(vectorChunks.slice(0, 5));
+            }
+        } else {
+            // ── Specific query strategy: pure vector search ───────────────
+            const queryEmbedding = await generateQueryEmbedding(userQuery);
+            const similarChunks = await findSimilarChunks(repoId, queryEmbedding, 15);
+
+            if (similarChunks.length === 0) {
+                yield `I couldn't find any relevant code in this repository to answer your question. ` +
+                      `(${total} chunks are indexed — try rephrasing your question.)`;
+                return;
+            }
+            context = buildContext(similarChunks);
+        }
+
+        yield "Found relevant code. Generating response...\n\n";
 
         // Build conversation history
         const history = conversationHistory
             .map((msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}`)
             .join("\n\n");
 
-        // Create prompt with RAG context
-        const prompt = `You are a helpful AI assistant analyzing a code repository. Answer the user's question based on the provided code context.
-
-${history ? `Previous conversation:\n${history}\n\n` : ""}Context from repository:
-${context}
-
-User question: ${userQuery}
-
-Instructions:
-- Answer based on the provided code context
+        // Tailor system prompt based on query type
+        const systemInstructions = overview
+            ? `You are analyzing a large software repository. Based on the file tree and documentation provided:
+- Produce a comprehensive, well-structured list of features and use cases
+- Infer features from file names, folder structure, README content, and manifests
+- Group related features into categories
+- Be thorough — the user wants a complete picture
+- Use bullet points and headers for readability`
+            : `You are a helpful AI assistant analyzing a code repository. Answer the user's question based on the provided code context.
 - Be specific and reference file paths when relevant
 - If the context doesn't contain enough information, say so
 - Provide code examples when helpful
 - Be concise but thorough`;
+
+        const prompt = `${systemInstructions}
+
+${history ? `Previous conversation:\n${history}\n\n` : ""}Context from repository:
+${context}
+
+User question: ${userQuery}`;
 
         // Stream response from Groq
         const stream = await groq.chat.completions.create({
             model: GROQ_MODEL,
             messages: [{ role: "user", content: prompt }],
             stream: true,
-            max_tokens: 1024,
+            max_tokens: overview ? 2048 : 1024,
         });
 
         for await (const chunk of stream) {

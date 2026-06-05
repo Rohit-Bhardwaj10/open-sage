@@ -131,7 +131,7 @@ export async function POST(
           const queryEmbedding = await generateQueryEmbedding(question.trim());
           const similar = await findSimilarChunks(repoId, queryEmbedding, 5);
           sources = similar
-            .filter((s) => s.similarity > 0.3) // only meaningful matches
+            .filter((s) => s.similarity > 0.2) // only meaningful matches
             .map((s) => ({
               file: s.file.filePath,
               lineStart: s.chunk.startLine,
