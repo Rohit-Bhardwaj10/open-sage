@@ -1,6 +1,6 @@
 generator client {
   provider = "prisma-client"
-  output   = "../app/generated/prisma"
+  output   = "../opensage/app/generated/prisma"
 }
 
 datasource db {

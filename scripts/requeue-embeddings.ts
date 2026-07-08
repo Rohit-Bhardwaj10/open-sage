@@ -1,6 +1,6 @@
 import "dotenv/config";
-import prisma from "../lib/prisma";
-import { getEmbeddingQueue } from "../lib/queue";
+import prisma from "../opensage/lib/prisma";
+import { getEmbeddingQueue } from "../opensage/lib/queue";
 import path from "path";
 
 /**

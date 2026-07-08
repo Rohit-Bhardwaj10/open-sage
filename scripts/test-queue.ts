@@ -3,7 +3,7 @@
  * Run: npx tsx scripts/test-queue.ts
  */
 
-import { getCloneQueue } from "@/lib/queue";
+import { getCloneQueue } from "../opensage/lib/queue";
 
 async function testQueue() {
     console.log("🧪 Testing Queue System\n");

@@ -4,8 +4,8 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { mkdir, rm, access } from "fs/promises";
 import path from "path";
-import prisma from "../lib/prisma";
-import { redis, QUEUE_NAMES, type CloneJobPayload, getIndexQueue } from "../lib/queue";
+import prisma from "../opensage/lib/prisma";
+import { redis, QUEUE_NAMES, type CloneJobPayload, getIndexQueue } from "../opensage/lib/queue";
 
 const execAsync = promisify(exec);
 

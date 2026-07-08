@@ -1,7 +1,7 @@
 import React from 'react';
 import { render } from 'ink';
 import App from '../tui/app';
-import prisma from '../lib/prisma';
+import prisma from '../opensage/lib/prisma';
 import dotenv from 'dotenv';
 import path from 'path';
 

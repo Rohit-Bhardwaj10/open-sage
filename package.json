@@ -1,51 +1,29 @@
 {
-  "name": "opensage",
-  "version": "0.1.0",
+  "name": "open-sage-monorepo",
+  "version": "1.0.0",
   "private": true,
+  "workspaces": [
+    "opensage",
+    "services/*",
+    "workers"
+  ],
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint",
-    "worker:clone": "tsx workers/clone-worker.ts",
-    "worker:index": "tsx workers/index-worker.ts",
-    "worker:embedding": "tsx workers/embedding-worker.ts",
+    "dev": "npm run dev --workspace=opensage",
+    "build": "npm run build --workspace=opensage",
+    "start": "npm run start --workspace=opensage",
+    "worker:clone": "npm run start:clone --workspace=workers",
+    "worker:index": "npm run start:index --workspace=workers",
+    "worker:embedding": "npm run start:embedding --workspace=workers",
     "worker:all": "concurrently -k -n clone,index,embed -c blue,green,yellow \"npm run worker:clone\" \"npm run worker:index\" \"npm run worker:embedding\"",
     "queue:check": "tsx scripts/check-queue.ts",
     "queue:clear": "tsx scripts/clear-queue.ts"
   },
-  "dependencies": {
-    "@google/generative-ai": "^0.24.1",
-    "@huggingface/inference": "^4.13.13",
-    "@prisma/adapter-pg": "^7.4.1",
-    "@prisma/client": "^7.4.1",
-    "@xenova/transformers": "^2.17.2",
-    "better-auth": "^1.4.18",
-    "bullmq": "^5.70.1",
-    "dotenv": "^17.3.1",
-    "groq-sdk": "^1.1.2",
-    "ioredis": "^5.9.3",
-    "next": "16.1.6",
-    "pg": "^8.18.0",
-    "react": "19.2.3",
-    "react-dom": "19.2.3"
-  },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
-    "@types/pg": "^8.16.0",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
     "concurrently": "^9.2.1",
-    "eslint": "^9",
-    "eslint-config-next": "16.1.6",
-    "ink": "^7.0.0",
-    "ink-select-input": "^6.2.0",
-    "ink-spinner": "^5.0.0",
-    "ink-text-input": "^6.0.0",
-    "prisma": "^7.4.1",
-    "tailwindcss": "^4",
-    "tsx": "^4.21.0",
-    "typescript": "^5"
+    "tsx": "^4.21.0"
+  },
+  "dependencies": {
+    "@prisma/client": "^7.4.1",
+    "dotenv": "^17.3.1"
   }
 }

@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { Queue } from "bullmq";
-import { redis, QUEUE_NAMES } from "../lib/queue";
+import { redis, QUEUE_NAMES } from "../opensage/lib/queue";
 
 async function checkQueues() {
     const cloneQueue = new Queue(QUEUE_NAMES.CLONE, { connection: redis });

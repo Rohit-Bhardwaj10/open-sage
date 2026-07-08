@@ -2,9 +2,9 @@ import "dotenv/config";
 import { Worker } from "bullmq";
 import { readFileSync, existsSync } from "fs";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import prisma from "../lib/prisma";
-import { redis } from "../lib/queue";
-import type { EmbeddingJobPayload } from "../lib/queue";
+import prisma from "../opensage/lib/prisma";
+import { redis } from "../opensage/lib/queue";
+import type { EmbeddingJobPayload } from "../opensage/lib/queue";
 
 // Must match the model used in lib/rag.ts exactly
 const EMBEDDING_MODEL = "text-embedding-004";

@@ -4,8 +4,8 @@ import { readdir, readFile } from "fs/promises";
 import path from "path";
 import crypto from "crypto";
 import { stat } from "fs/promises";
-import prisma from "../lib/prisma";
-import { redis, QUEUE_NAMES, getEmbeddingQueue, type IndexJobPayload } from "../lib/queue";
+import prisma from "../opensage/lib/prisma";
+import { redis, QUEUE_NAMES, getEmbeddingQueue, type IndexJobPayload } from "../opensage/lib/queue";
 
 // ── Configuration ─────────────────────────────────────────────
 const SUPPORTED_EXTENSIONS = new Set([
