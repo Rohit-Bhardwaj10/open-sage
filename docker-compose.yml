@@ -1,9 +1,33 @@
 version: "3.9"
 
+#  Infrastructure:  postgres  |  redis
+#  App:             frontend  (Next.js)
+#  Workers:         worker-clone  |  worker-index  |  worker-embedding
+
+x-worker-base: &worker-base       # shared config for all three workers
+  build:
+    context: .
+    dockerfile: workers/Dockerfile
+  restart: unless-stopped
+  volumes:
+    - clones_data:/app/.clones
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER:-opensage}:${POSTGRES_PASSWORD:-opensage_secret}@postgres:5432/${POSTGRES_DB:-opensage_db}
+    REDIS_URL: redis://redis:6379
+    CLONES_DIR: /app/.clones
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
 services:
+  # ── Infrastructure ───────────────────────────────────────────────
+
   postgres:
-    image: pgvector/pgvector:pg16        # pgvector built-in for Phase 2
-    container_name: open-sage-db
+    image: pgvector/pgvector:pg16
+    container_name: opensage-db
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-opensage}
@@ -20,23 +44,73 @@ services:
       timeout: 5s
       retries: 5
 
-  # Redis (queue backbone) 
   redis:
     image: redis:7-alpine
-    container_name: open-sage-redis
+    container_name: opensage-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes  # persist queue across restarts
+    command: redis-server --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  # ── Next.js frontend ─────────────────────────────────────────────
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: opensage-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-opensage}:${POSTGRES_PASSWORD:-opensage_secret}@postgres:5432/${POSTGRES_DB:-opensage_db}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── BullMQ Workers ───────────────────────────────────────────────
+
+  worker-clone:
+    <<: *worker-base
+    container_name: opensage-worker-clone
+    command: ["tsx", "workers/clone-worker.ts"]
+
+  worker-index:
+    <<: *worker-base
+    container_name: opensage-worker-index
+    command: ["tsx", "workers/index-worker.ts"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      worker-clone:
+        condition: service_started
+
+  worker-embedding:
+    <<: *worker-base
+    container_name: opensage-worker-embedding
+    command: ["tsx", "workers/embedding-worker.ts"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      worker-index:
+        condition: service_started
+
 volumes:
   postgres_data:
   redis_data:
-  clones_data:     
+  clones_data:
